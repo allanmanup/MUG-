@@ -4,8 +4,46 @@ import { buildEmailContent } from '../email-template.js';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
+const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY || null;
+const TEAM_EMAILS = (process.env.TEAM_EMAILS || '').split(',').map(s => s.trim()).filter(Boolean);
+const EMAIL_FROM = process.env.EMAIL_FROM || 'no-reply@example.com';
+
+async function sendEmail({ to, subject, html, cc }) {
+  if (!SENDGRID_API_KEY) {
+    console.warn('SENDGRID_API_KEY not configured; skipping sendEmail');
+    return { ok: true, skipped: true };
+  }
+
+  const personalizations = [{ to: Array.isArray(to) ? to.map(a => ({ email: a })) : [{ email: to }] }];
+  if (cc && cc.length) personalizations[0].cc = cc.map(a => ({ email: a }));
+
+  const body = {
+    personalizations,
+    from: { email: EMAIL_FROM },
+    subject: subject,
+    content: [{ type: 'text/html', value: html }]
+  };
+
+  const res = await fetch('https://api.sendgrid.com/v3/mail/send', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${SENDGRID_API_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(body)
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`SendGrid error ${res.status}: ${text}`);
+  }
+
+  return { ok: true };
+}
+
 // This endpoint is intended to be run as a scheduled function (cron) or invoked manually.
-// For the prototype it will mark outbox jobs as done without sending real emails.
+// It will process pending outbox jobs, attempt delivery via SendGrid (if configured),
+// update lead rows, and mark jobs done or failed.
 export default async function handler(req, res) {
   try {
     const now = new Date().toISOString();
@@ -44,12 +82,28 @@ export default async function handler(req, res) {
 
       try {
         if (job.type === 'email') {
-          // Build the email content (prototype)
+          // Fetch lead to get email/name
+          const { data: lead } = await supabase.from('leads').select('*').eq('id', job.lead_id).single();
           const payload = job.payload || {};
-          const leadId = job.lead_id;
-          // mark email as sent in leads (we pretend success)
-          await supabase.from('leads').update({ email_sent: true, email_error: null }).eq('id', leadId);
+          const to = lead?.email ? [lead.email] : (payload.to || []);
+          const { subject, html } = buildEmailContent({ name: lead?.name || payload.name || 'Participant', quizKey: lead?.quiz_key || payload.quizKey, bandKey: lead?.band_key || payload.bandKey, compositeScore: payload.compositeScore || lead?.composite_score || null });
+
+          try {
+            // send to lead and CC team if configured
+            const cc = TEAM_EMAILS.length ? TEAM_EMAILS : undefined;
+            await sendEmail({ to, subject, html, cc });
+
+            // mark email as sent in leads
+            if (lead) {
+              await supabase.from('leads').update({ email_sent: true, email_error: null }).eq('id', lead.id);
+            }
+          } catch (sendErr) {
+            console.error('Send failed for job', job.id, sendErr);
+            await handleJobFailure(job, String(sendErr));
+            continue;
+          }
         } else if (job.type === 'constant_contact') {
+          // placeholder for external integration
           await supabase.from('leads').update({ cc_synced: true, cc_sync_error: null }).eq('id', job.lead_id);
         } else if (job.type === 'alert') {
           console.log('ALERT:', job.payload && job.payload.message);
